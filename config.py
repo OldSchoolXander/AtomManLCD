@@ -35,3 +35,11 @@ UNLOCK_WINDOW = float(os.getenv("ATOMMAN_UNLOCK_SECONDS", "5.0"))
 
 # Sleep after each serial write (avoids flooding the firmware).
 POST_WRITE_SLEEP = float(os.getenv("ATOMMAN_WRITE_SLEEP", "0.006"))
+
+# ===================== GPU Tile =====================
+# Metric shown in the Useage field of the GPU LCD tile.
+#   "vram" → VRAM/RAM occupation % — reliable for all GPU types and workloads
+#            (AMD: drm-memory-vram via fdinfo / Intel: drm-total-system0 via fdinfo)
+#   "busy" → GPU engine busy % — AMD: gpu_busy_percent sysfs (may read 0 for
+#            Vulkan/compute workloads) / Intel: drm-engine-render delta via fdinfo
+GPU_TILE_USEAGE = os.getenv("ATOMMAN_GPU_TILE_USEAGE", "vram")

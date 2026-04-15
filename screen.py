@@ -7,8 +7,8 @@ and the unlock/activation sequence.
 
 Hardware:
   - AtomMan screen : /dev/serial/by-id/usb-Synwit_USB_Virtual_COM-if00
-  - Primary GPU    : AMD Radeon RX 7900 XTX  (card0)
-  - Secondary GPU  : Intel Arc Graphics       (card1, shown on AtomMan screen)
+  - Primary GPU    : AMD Radeon RX 7900 XTX  (shown on AtomMan screen if present)
+  - Secondary GPU  : Intel Arc Graphics       (shown on AtomMan screen if no AMD)
 
 Protocol summary:
   ENQ  (device→host) : AA 05 <SEQ> CC 33 C3 3C
@@ -27,6 +27,7 @@ from config import (
     PORT, BAUD, RTSCTS, DSRDTR, TRAILER,
     DEFAULT_WAIT_START, UNLOCK_WINDOW, POST_WRITE_SLEEP,
     OW_API_KEY, OW_UNITS, WEATHER_REFRESH_SECONDS,
+    GPU_TILE_USEAGE,
 )
 from colors import colorize, temp_color, util_color, usage_color, C
 from cpu    import cpu_model, cpu_usage_pct, cpu_temp_c, cpu_freq_khz, fan_cpu_rpm
@@ -76,10 +77,24 @@ def p_cpu() -> str:
             f"Useage:{cpu_usage_pct()};Freq:{cpu_freq_khz()};Tempr1:{t};}}")
 
 
-def p_gpu_intel() -> str:
-    """GPU tile: always shows Intel Arc (the GPU embedded in the AtomMan screen)."""
-    name, temp, util = get_intel_arc_info()
-    return f"{{GPU:{name};Tempr:{temp};Useage:{util}}}"
+def p_gpu() -> str:
+    """GPU tile: shows AMD if present, otherwise Intel Arc.
+
+    The Useage field is controlled by GPU_TILE_USEAGE in config.py:
+      "vram" → VRAM/RAM occupation % (default)
+      "busy" → GPU engine busy %
+    """
+    if detect_gpu_vendor() == "amd":
+        name, temp, busy_pct = gpu_info()
+        vram_used, vram_total = gpu_vram_info()
+        vram_pct = int(vram_used * 100 / vram_total) if vram_total else 0
+    else:
+        name, temp, busy_pct = get_intel_arc_info()
+        mem_used, mem_total = intel_igpu_mem_info()
+        vram_pct = int(mem_used * 100 / mem_total) if mem_total else 0
+
+    useage = vram_pct if GPU_TILE_USEAGE == "vram" else busy_pct
+    return f"{{GPU:{name};Tempr:{temp};Useage:{useage}}}"
 
 
 def p_mem() -> str:
@@ -121,11 +136,11 @@ def p_net() -> str:
 
 
 # Tile rotation used during the unlock phase
-UNLOCK_ROT = [(CPU, p_cpu), (GPU, p_gpu_intel), (MEM, p_mem)]
+UNLOCK_ROT = [(CPU, p_cpu), (GPU, p_gpu), (MEM, p_mem)]
 
 # Tile rotation for steady-state operation (no VOL/BAT — mini PC)
 FULL_ROT = [
-    (CPU, p_cpu), (GPU, p_gpu_intel), (MEM, p_mem),
+    (CPU, p_cpu), (GPU, p_gpu), (MEM, p_mem),
     (DSK, p_dsk), (DAT, p_date),    (NET, p_net),
 ]
 

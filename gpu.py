@@ -280,13 +280,33 @@ def _amd_gpu_info() -> tuple[str, int, int, int, int]:
             if temp:
                 break
 
-    # GPU name from sysfs product_name or device name
+    # GPU name: sysfs product_name / name, then lspci fallback.
     for path in (f"{card}/device/product_name", f"{card}/device/name"):
         if os.path.exists(path):
             raw = clean_gpu_name(_read(path).strip())
             if raw:
                 name = raw
             break
+    if name == "AMD GPU":
+        # sysfs didn't help — parse lspci using the PCI_ID from uevent.
+        uevent = _read(f"{card}/device/uevent")
+        m = re.search(r"PCI_ID=([0-9A-Fa-f]+):([0-9A-Fa-f]+)", uevent)
+        if m:
+            pci_id = f"{m.group(1).lower()}:{m.group(2).lower()}"
+            lspci_out = _run(["lspci", "-d", f"1002:{m.group(2)}", "-mm"])
+            if lspci_out:
+                # Format: <slot> "<class>" "<vendor>" "<device>" ... "<subdevice>"
+                # We prefer the subsystem device name (last quoted field) if it
+                # looks like a real product name, otherwise the device name.
+                fields = re.findall(r'"([^"]*)"', lspci_out.splitlines()[0])
+                # fields: [class, vendor, device, subvendor, subdevice]
+                sub_name = clean_gpu_name(fields[4]) if len(fields) > 4 else ""
+                dev_name = clean_gpu_name(fields[2]) if len(fields) > 2 else ""
+                # Use subsystem name if it contains a recognisable product string
+                if sub_name and any(k in sub_name for k in ("RX", "Radeon", "Pro", "Vega", "NITRO", "Pulse", "Trio")):
+                    name = sub_name
+                elif dev_name:
+                    name = dev_name
 
     # GPU utilization % (amdgpu driver exposes this directly)
     s = _read(f"{card}/device/gpu_busy_percent").strip()
