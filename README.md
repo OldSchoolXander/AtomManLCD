@@ -22,25 +22,25 @@ framing, payload format, firmware icon codes) originates from that work.
 |---|---|
 | Machine | Minisforum AtomMan X7 Ti |
 | CPU | Intel Core Ultra 9 185H (Meteor Lake) |
-| Primary GPU | AMD Radeon RX 7900 XTX (amdgpu driver) — *test card* |
+| Primary GPU | AMD Radeon RX 7900 XTX (amdgpu driver) — *tested card* |
 | Secondary GPU (iGPU) | Intel Arc Graphics (i915 driver) |
 | RAM | 96 GB DDR5 |
 | LCD panel | USB serial — `/dev/serial/by-id/usb-Synwit_USB_Virtual_COM-if00` |
 
-The LCD is internally wired to the Intel Arc iGPU.  The AMD Radeon is the
-primary display GPU and is shown in the dashboard only.
+The LCD panel is internally wired to the Intel Arc iGPU.  When an external
+AMD GPU is present, it is shown on the LCD GPU tile (it is the main workload
+GPU).  If no AMD GPU is detected, the Intel Arc is shown instead.
 
 ---
 
 ## Architecture
 
-The original project was a single monolithic `screen.py`.  This fork splits
-the code into focused, independently-testable modules:
+The code is split into focused, independently-testable modules:
 
 | File | Responsibility |
 |---|---|
 | `screen.py` | Serial protocol, tile rotation, unlock sequence, dashboard |
-| `gpu.py` | AMD and Intel Arc GPU metrics (temp, util%, VRAM/RAM) |
+| `gpu.py` | AMD and Intel Arc GPU metrics (temp, VRAM%, name) |
 | `cpu.py` | CPU model, usage %, temperature, frequency, fan RPM |
 | `ram.py` | RAM used/available/total, vendor detection |
 | `disk.py` | Disk usage, temperature, label |
@@ -52,165 +52,95 @@ the code into focused, independently-testable modules:
 
 ---
 
-## Improvements over the original
+## GPU handling
 
-### 1. Modular code structure
+### LCD tile
 
-The single-file `screen.py` has been split into the modules listed above.
-Each module has its own cache, TTL, and public API, making the codebase
-easier to read, test, and extend.
+The GPU tile on the LCD always shows the **primary workload GPU**:
 
----
+- If an AMD GPU is detected → AMD name, temperature, VRAM occupation %
+- Otherwise → Intel Arc name, temperature, RAM occupation %
 
-### 2. Full Intel Arc iGPU support
+GPU card slot assignment (`card0`, `card1`, …) is resolved dynamically at
+runtime by scanning `/sys/class/drm/card*/device/vendor`.  The result is
+cached permanently so there is no overhead per cycle.  This makes the driver
+resilient to cardN renumbering across reboots.
 
-The original had no Intel Arc support.  This fork adds three metrics for the
-iGPU via the **DRM fdinfo** interface (`/proc/*/fdinfo/*`), which the i915
-driver exposes for every DRM client:
+### GPU tile Useage field
 
-- **Utilization %** — computed from `drm-engine-render` cumulative nanoseconds
-  delta over a 3-second window, summed across all i915 clients and deduplicated
-  by `drm-client-id`.
-- **Memory used** — sum of `drm-total-system0` (system RAM allocated as GPU
-  memory) across all unique i915 clients.  Unit is KiB (see fix #4 below).
-- **Memory total** — set to 50 % of system RAM as a practical upper bound for
-  iGPU allocation.
+The `Useage` value sent to the LCD is configurable via `GPU_TILE_USEAGE` in
+`config.py`:
 
-The service runs as root so it can scan all processes' fdinfo, including
-KDE Plasma, Xwayland, browsers, etc.
+| Value | Description |
+|---|---|
+| `"vram"` *(default)* | VRAM/RAM occupation % — reliable for all workload types including Vulkan/compute |
+| `"busy"` | GPU engine busy % — AMD: `gpu_busy_percent` sysfs / Intel: `drm-engine-render` delta via fdinfo |
 
----
+Can also be set at runtime via the environment variable
+`ATOMMAN_GPU_TILE_USEAGE`.
 
-### 3. AMD VRAM via DRM fdinfo — correct Vulkan tracking
+### AMD VRAM tracking
 
-The original read VRAM usage from
-`/sys/class/drm/card0/device/mem_info_vram_used`, which **does not track
-Vulkan (radv) allocations**.  Loading a large model in LM Studio via the
-Vulkan backend would show only ~50 MB of VRAM used regardless of actual
-allocation.
+VRAM usage is read from DRM fdinfo (`/proc/*/fdinfo/*`, field
+`drm-memory-vram: X KiB`), not from sysfs `mem_info_vram_used`.  The fdinfo
+approach correctly tracks all DRM Buffer Objects including those allocated by
+**radv (Vulkan)**, OpenGL, and Vulkan compute — which sysfs misses entirely.
 
-This fork replaces that sysfs read with a DRM fdinfo scan, reading
-`drm-memory-vram: X KiB` per amdgpu client and summing them deduplicated by
-`drm-client-id`.  This correctly reflects all DRM Buffer Objects including
-those allocated by radv (Vulkan), OpenGL, and Vulkan compute workloads.
+The service must run as root to scan all processes' fdinfo.
 
-`mem_info_vram_total` is still read from sysfs (it is a static hardware value
-and always accurate).
+> **Compatibility:** requires the `amdgpu` driver and the DRM fdinfo interface
+> introduced in **Linux 5.19**.  Works with any AMD GPU using `amdgpu` + `radv`.
 
-> **Compatibility:** this mechanism relies on the `amdgpu` kernel driver and
-> the DRM fdinfo interface introduced in **Linux 5.19**.  It works with any
-> AMD GPU using `amdgpu` + `radv` (Mesa Vulkan driver) — the RX 7900 XTX is
-> simply the card this was developed and validated on.
+### AMD GPU name
 
----
+`product_name` and `name` sysfs files are absent on some cards (including the
+RX 7900 XTX).  The driver falls back to `lspci -mm`, preferring the subsystem
+device name (e.g. `NITRO+ RX 7900 XTX Vapor-X`) over the generic device name.
 
-### 4. KiB unit bug fix — Intel Arc memory
+### Intel Arc memory tracking
 
-`drm-total-system0` values in i915 fdinfo are expressed in **KiB**, not bytes.
-The original implementation treated them as bytes and divided by 1 024 × 1 024,
-producing a result of 0 MB even when KDE Plasma alone allocates ~200 MB on the
-Arc iGPU.
+Memory usage is read from DRM fdinfo field `drm-total-system0: X KiB`
+(system RAM allocated as GPU memory).  Values are in KiB and converted with
+a single `// 1024` division.  Memory total is set to 50% of system RAM as a
+practical upper bound for iGPU allocation.
 
-Fix: values are now stored as `mem_kib` and converted with a single `// 1024`
-division.
+### Intel Arc temperature
 
----
+Sensor priority:
 
-### 5. Intel Arc temperature — better sensor + EMA smoothing
+1. `i915` native hwmon on the Intel card (`<intel_card>/device/hwmon/hwmon*/temp1_input`)
+2. `coretemp "Package id 0"` — SoC-wide proxy, used as fallback
 
-**Problem:** the previous approach read `coretemp "Package id 0"`, which is the
-*maximum* temperature across the entire Meteor Lake SoC (CPU P-cores, E-cores,
-SoC tile, …).  Any brief CPU burst spikes this value to 70 °C even when the
-GPU is idle, producing misleading peaks on the LCD.
+An EMA (α = 0.5) is applied to suppress transient spikes caused by CPU bursts
+on the shared Meteor Lake SoC die.
 
-**Fix — sensor selection (priority order):**
+### Terminal dashboard
 
-1. `i915` native hwmon on the Intel card (`<intel_card>/device/hwmon/hwmon*/temp1_input`) —
-   true GPU junction temperature when exposed by the kernel/firmware.
-2. `coretemp "Package id 0"` — SoC-wide proxy, used as fallback.
+The dashboard displays both GPUs when both are present:
 
-**Fix — EMA smoothing (α = 0.5):**
+- **AMD GPU** — name, temperature, engine busy %, VRAM used/total/occupation %
+- **Intel Arc** — name, temperature (EMA-smoothed), RAM used/total/occupation %
 
-An exponential moving average is applied to the raw reading.  A single-sample
-spike is halved rather than shown verbatim.  A sustained temperature change
-converges within 3–4 refresh cycles (~30–40 s with the 10-second cache).
-
-```
-Example — CPU burst spike of 70 °C while GPU is at 45 °C:
-  Raw (before):  45 → 45 → 70 → 45 → 45   (spike fully visible)
-  EMA (after):   45 → 45 → 57 → 51 → 48   (spike absorbed)
-```
+The dashboard redraws only when data changes (hash comparison), eliminating
+unnecessary flicker.
 
 ---
 
-### 6. Weather night icons
+## Weather
 
-The original `_map_wmo_to_weather_n()` function always returned daytime icon
-codes, even at night.  The comment in the code acknowledged this as a known
-limitation ("Open-Meteo provides no day/night icon").
-
-This fork requests the `is_day` field from the Open-Meteo `current` endpoint
-(available in the standard free API) and passes it through the mapping
-function.  Night-specific AtomMan firmware icon codes are now used when
-`is_day == 0`:
-
-| WMO code | Condition | Day icon | Night icon |
-|---|---|---|---|
-| 0 | Clear sky | 1 | **3** |
-| 1 | Mainly clear | 5 | **6** |
-| 2 | Partly cloudy | 7 | **8** |
-| 3+ | Overcast / rain / snow / storm | unchanged | unchanged |
-
-WMO codes 1 and 2 were also previously collapsed into the same icon (5).
-They are now mapped separately (5/6 for mainly clear, 7/8 for partly cloudy).
-
-The OpenWeather fallback path already handled day/night correctly via the
-`d`/`n` icon suffix; it is unchanged.
-
----
-
-### 7. Dual weather source with automatic fallback
-
-- **Primary:** [Open-Meteo](https://open-meteo.com/) — free, no API key required.
+- **Primary source:** [Open-Meteo](https://open-meteo.com/) — free, no API key required.
 - **Fallback:** [OpenWeather One Call API](https://openweathermap.org/api) —
   used only when Open-Meteo fails and `OW_API_KEY` is set in `config.py`.
 
----
+Day/night icon codes are selected automatically using the `is_day` field from
+the Open-Meteo `current` endpoint:
 
-### 8. Diff-based dashboard
-
-The terminal dashboard redraws only when the data dict actually changes
-(hash comparison).  This eliminates unnecessary screen flicker when metrics
-are stable.
-
----
-
-### 9. Dashboard shows both GPUs
-
-The live dashboard displays:
-
-- **AMD Radeon RX 7900 XTX** — name, temperature, utilization %, VRAM used/total/%.
-- **Intel Arc Graphics** — name, temperature (EMA-smoothed), utilization %,
-  system RAM used/total/%.
-
-The LCD panel itself shows only the Intel Arc tile (it is the GPU the screen
-is wired to).
-
----
-
-### 10. Dynamic GPU card-slot resolution
-
-The original code assumed `card0` = AMD and `card1` = Intel Arc.  The
-kernel assigns DRM card indices in probe order, which can change across
-reboots (especially after a kernel or firmware update).
-
-This fork introduces `_resolve_card_path(vendor)` in `gpu.py`, which scans
-`/sys/class/drm/card*/device/vendor` in sorted order at runtime and returns
-the correct card path for the requested vendor (`"amd"` → `0x1002`,
-`"intel"` → `0x8086`).  Results are cached for the lifetime of the process.
-
-All sysfs paths that previously hardcoded `card0` or `card1` now go through
-this resolver, making the driver resilient to cardN renumbering.
+| WMO code | Condition | Day icon | Night icon |
+|---|---|---|---|
+| 0 | Clear sky | 1 | 3 |
+| 1 | Mainly clear | 5 | 6 |
+| 2 | Partly cloudy | 7 | 8 |
+| 3+ | Overcast / rain / snow / storm | unchanged | unchanged |
 
 ---
 
@@ -219,12 +149,14 @@ this resolver, making the driver resilient to cardN renumbering.
 ```
 Python 3.10+
 pyserial
+lspci (pciutils)
 ```
 
 The service must run as **root** to read `/proc/*/fdinfo/*` for all processes.
 
 ```bash
 pip install pyserial
+sudo apt install pciutils
 ```
 
 ---
@@ -237,6 +169,7 @@ Edit `config.py`:
 |---|---|---|
 | `PORT` | `/dev/serial/by-id/usb-Synwit_USB_Virtual_COM-if00` | Serial port |
 | `BAUD` | `115200` | Baud rate |
+| `GPU_TILE_USEAGE` | `"vram"` | Metric for GPU tile: `"vram"` or `"busy"` |
 | `OW_API_KEY` | `""` | OpenWeather API key (optional) |
 | `OW_LOCATION` | `""` | City, `"zip,country"`, or `"lat,lon"` |
 | `OW_UNITS` | `"metric"` | `"metric"` or `"imperial"` |
@@ -288,7 +221,7 @@ AA <TileID> 00 <SEQ> {ASCII payload} CC 33 C3 3C
 | Tile | ID | Payload example |
 |---|---|---|
 | CPU | `0x53` | `{CPU:Intel Core Ultra 9;Tempr:45;Useage:7;Freq:2400000;Tempr1:45;}` |
-| GPU | `0x36` | `{GPU:Intel Arc Graphics;Tempr:38;Useage:12}` |
+| GPU | `0x36` | `{GPU:NITRO+ RX 7900 XTX Vapor-X;Tempr:52;Useage:97}` |
 | MEM | `0x49` | `{Memory:Micron DDR5;Used:18.4;Available:74.2;Total:92.6;Useage:20}` |
 | DISK | `0x4F` | `{DiskName:Samsung 990 Pro;Tempr:41;UsageSpace:512;AllSpace:1907;Usage:27}` |
 | DATE | `0x6B` | `{Date:2026/04/15;Time:22:10:00;Week:4;Weather:3;TemprLo:9,TemprHi:21,Zone:Paris,Desc:clear sky}` |
