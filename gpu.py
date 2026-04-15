@@ -2,10 +2,11 @@
 gpu.py — GPU detection and metrics.
 
 Hardware context:
-  - card0 : AMD Radeon RX 7900 XTX  (vendor 0x1002, hwmon = amdgpu)
-  - card1 : Intel Arc Graphics       (vendor 0x8086, temp proxy = coretemp
-                                      "Package id 0", driver = i915)
+  - AMD GPU   (vendor 0x1002, amdgpu driver, hwmon = amdgpu)
+  - Intel Arc (vendor 0x8086, i915 driver, temp proxy = coretemp "Package id 0")
 
+The cardN slot assigned to each GPU is resolved dynamically at runtime by
+scanning /sys/class/drm/card*/device/vendor — no hardcoded card0/card1.
 Detection order: AMD → Intel → NVIDIA (AMD is the primary display GPU).
 
 Public API:
@@ -44,10 +45,12 @@ def clean_gpu_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Vendor detection (cached forever — hardware doesn't change at runtime)
+# Vendor detection + card path resolution
+# (cached forever — PCI slots don't change at runtime)
 # ---------------------------------------------------------------------------
 
 _gpu_vendor_cache: str | None = None
+_card_path_cache:  dict[str, str] = {}   # vendor → "/sys/class/drm/cardN"
 
 _VENDOR_IDS = {
     0x1002: "amd",
@@ -56,26 +59,48 @@ _VENDOR_IDS = {
 }
 
 
+def _resolve_card_path(vendor: str) -> str:
+    """Return the /sys/class/drm/cardN sysfs path for the given vendor.
+
+    Scans card*/device/vendor in sorted order so the lowest-numbered card
+    for a given vendor is always returned.  Result is cached permanently.
+    Returns "" when the vendor is not found.
+    """
+    if vendor in _card_path_cache:
+        return _card_path_cache[vendor]
+
+    target_id = next((k for k, v in _VENDOR_IDS.items() if v == vendor), None)
+    if target_id is None:
+        return ""
+
+    for vendor_path in sorted(glob.glob("/sys/class/drm/card*/device/vendor")):
+        try:
+            if int(_read(vendor_path).strip(), 16) == target_id:
+                # vendor_path = /sys/class/drm/cardN/device/vendor
+                card_path = os.path.dirname(os.path.dirname(vendor_path))
+                _card_path_cache[vendor] = card_path
+                return card_path
+        except (ValueError, IOError):
+            pass
+
+    return ""
+
+
 def detect_gpu_vendor() -> str:
     """Detect the primary GPU vendor by reading PCI vendor IDs from sysfs.
 
     Returns one of: "amd", "intel", "nvidia", "unknown".
     AMD is checked first since it is the main display GPU on this system.
+    Also populates _card_path_cache as a side-effect.
     """
     global _gpu_vendor_cache
     if _gpu_vendor_cache is not None:
         return _gpu_vendor_cache
 
-    # Preferred order: AMD first, then Intel, then NVIDIA.
     for preferred_vendor in ("amd", "intel", "nvidia"):
-        target_id = next(k for k, v in _VENDOR_IDS.items() if v == preferred_vendor)
-        for vendor_path in glob.glob("/sys/class/drm/card*/device/vendor"):
-            try:
-                if int(_read(vendor_path).strip(), 16) == target_id:
-                    _gpu_vendor_cache = preferred_vendor
-                    return preferred_vendor
-            except (ValueError, IOError):
-                pass
+        if _resolve_card_path(preferred_vendor):
+            _gpu_vendor_cache = preferred_vendor
+            return preferred_vendor
 
     _gpu_vendor_cache = "unknown"
     return "unknown"
@@ -223,14 +248,18 @@ def _amd_gpu_info() -> tuple[str, int, int, int, int]:
     util = 0
     vram_used_mb = 0
     vram_total_mb = 0
-    name = "AMD Radeon RX 7900 XTX"
+    name = "AMD GPU"
 
-    # Find the amdgpu hwmon directory
+    card = _resolve_card_path("amd")
+    if not card:
+        return name, temp, util, vram_used_mb, vram_total_mb
+
+    # Find the amdgpu hwmon directory — search on the specific card first,
+    # then fall back to /sys/class/hwmon/* (same result, different sysfs view).
     hw_path = ""
-    for p in glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*"):
-        hw_name = _read(os.path.join(os.path.dirname(p), "name")).strip().lower()
-        if "amdgpu" in hw_name:
-            hw_path = p
+    for hw in glob.glob(f"{card}/device/hwmon/hwmon*"):
+        if _read(os.path.join(hw, "name")).strip().lower() == "amdgpu":
+            hw_path = hw
             break
     if not hw_path:
         for hw in glob.glob("/sys/class/hwmon/hwmon*"):
@@ -252,8 +281,7 @@ def _amd_gpu_info() -> tuple[str, int, int, int, int]:
                 break
 
     # GPU name from sysfs product_name or device name
-    for path in ("/sys/class/drm/card0/device/product_name",
-                 "/sys/class/drm/card0/device/name"):
+    for path in (f"{card}/device/product_name", f"{card}/device/name"):
         if os.path.exists(path):
             raw = clean_gpu_name(_read(path).strip())
             if raw:
@@ -261,7 +289,7 @@ def _amd_gpu_info() -> tuple[str, int, int, int, int]:
             break
 
     # GPU utilization % (amdgpu driver exposes this directly)
-    s = _read("/sys/class/drm/card0/device/gpu_busy_percent").strip()
+    s = _read(f"{card}/device/gpu_busy_percent").strip()
     if s.isdigit():
         util = int(s)
 
@@ -269,7 +297,7 @@ def _amd_gpu_info() -> tuple[str, int, int, int, int]:
     # VRAM total: sysfs (bytes → MiB, static hardware value).
     _refresh_amd_fdinfo()
     vram_used_mb = _amd_fdinfo_cache["vram_used_mb"]
-    s = _read("/sys/class/drm/card0/device/mem_info_vram_total").strip()
+    s = _read(f"{card}/device/mem_info_vram_total").strip()
     if s.isdigit():
         vram_total_mb = int(s) // (1024 * 1024)
 
@@ -435,7 +463,7 @@ def intel_igpu_mem_info() -> tuple[int, int]:
 # when the GPU itself is cold.
 #
 # Sensor priority:
-#   1. i915 native hwmon on card1  (GPU-junction temp, only available on
+#   1. i915 native hwmon on the Intel card  (GPU-junction temp, only available on
 #      some kernel/firmware combos — gives a true GPU tile reading)
 #   2. coretemp "Package id 0"     (SoC-wide proxy, always available)
 #
@@ -449,19 +477,21 @@ def _read_intel_gpu_temp() -> int:
     """Read the best available Intel Arc temperature in °C.
 
     Tries, in order:
-      1. i915 hwmon on /sys/class/drm/card1/device/hwmon/hwmon*/temp1_input
+      1. i915 hwmon on <intel_card>/device/hwmon/hwmon*/temp1_input
          (direct GPU junction temperature when exposed by the driver)
       2. coretemp hwmon label "Package id 0"
          (SoC-wide proxy; also reflects CPU activity)
     Returns 0 when no sensor is accessible.
     """
-    # 1. i915 native GPU hwmon on card1
-    for hw in glob.glob("/sys/class/drm/card1/device/hwmon/hwmon*"):
-        s = _read(os.path.join(hw, "temp1_input")).strip()
-        if s.isdigit():
-            v = int(s)
-            if v > 0:
-                return v // 1000 if v > 1000 else v
+    # 1. i915 native GPU hwmon on the Intel card
+    intel_card = _resolve_card_path("intel")
+    if intel_card:
+        for hw in glob.glob(f"{intel_card}/device/hwmon/hwmon*"):
+            s = _read(os.path.join(hw, "temp1_input")).strip()
+            if s.isdigit():
+                v = int(s)
+                if v > 0:
+                    return v // 1000 if v > 1000 else v
 
     # 2. coretemp "Package id 0" fallback
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
@@ -502,7 +532,7 @@ def _apply_intel_temp_ema(raw: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Intel Arc info (always card1 on this system, cached 10 s)
+# Intel Arc info (resolved dynamically via _resolve_card_path, cached 10 s)
 # ---------------------------------------------------------------------------
 
 _intel_cache = {"name": "Intel Arc Graphics", "temp": 0, "ts": 0.0}
@@ -533,15 +563,16 @@ def get_intel_arc_info() -> tuple[str, int, int]:
     raw_temp   = _read_intel_gpu_temp()
     intel_temp = _apply_intel_temp_ema(raw_temp)
 
-    # GPU name from card1
+    # GPU name from the Intel card
     intel_name = "Intel Arc Graphics"
-    for path in ("/sys/class/drm/card1/device/product_name",
-                 "/sys/class/drm/card1/device/name"):
-        if os.path.exists(path):
-            raw = clean_gpu_name(_read(path).strip())
-            if raw:
-                intel_name = raw
-            break
+    intel_card = _resolve_card_path("intel")
+    if intel_card:
+        for path in (f"{intel_card}/device/product_name", f"{intel_card}/device/name"):
+            if os.path.exists(path):
+                raw = clean_gpu_name(_read(path).strip())
+                if raw:
+                    intel_name = raw
+                break
     if "Intel" not in intel_name and "Arc" not in intel_name:
         intel_name = "Intel Arc Graphics"
 
