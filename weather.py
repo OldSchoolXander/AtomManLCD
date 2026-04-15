@@ -131,17 +131,21 @@ def _geocode_openmeteo(location: str) -> tuple[float, float, str] | None:
 # WMO weather code helpers
 # ---------------------------------------------------------------------------
 
-def _map_wmo_to_weather_n(code: int) -> int:
+def _map_wmo_to_weather_n(code: int, is_day: bool = True) -> int:
     """Map a WMO weather code to an AtomMan weatherN display code.
 
-    Always returns the daytime variant (Open-Meteo provides no day/night icon).
+    is_day  True  → daytime icons (default)
+            False → night icons for clear/few-cloud/partly-cloudy conditions
+                    (other conditions are identical day and night)
     """
     if code == 0:
-        return 1    # Clear sky
-    if code in (1, 2):
-        return 5    # Mainly clear / partly cloudy
+        return 1 if is_day else 3    # Clear sky
+    if code == 1:
+        return 5 if is_day else 6    # Mainly clear
+    if code == 2:
+        return 7 if is_day else 8    # Partly cloudy
     if code == 3:
-        return 9    # Overcast
+        return 9                     # Overcast — same icon day and night
     if code in (45, 48):
         return 30   # Fog / depositing rime fog
     if code in (51, 53, 55):
@@ -224,7 +228,7 @@ def _fetch_openmeteo() -> dict | None:
     qs = urllib.parse.urlencode({
         "latitude":         f"{lat:.6f}",
         "longitude":        f"{lon:.6f}",
-        "current":          "temperature_2m,weather_code",
+        "current":          "temperature_2m,weather_code,is_day",
         "daily":            "weather_code,temperature_2m_max,temperature_2m_min",
         "timezone":         "auto",
         "forecast_days":    "1",
@@ -237,13 +241,14 @@ def _fetch_openmeteo() -> dict | None:
     if not cur or not daily:
         return None
 
-    code = int(cur.get("weather_code", 0) or 0)
-    lo   = int(round(float((daily.get("temperature_2m_min") or [0])[0])))
-    hi   = int(round(float((daily.get("temperature_2m_max") or [0])[0])))
-    desc = _wmo_code_to_desc(code)
+    code   = int(cur.get("weather_code", 0) or 0)
+    is_day = bool(int(cur.get("is_day", 1) or 1))   # 1 = day, 0 = night
+    lo     = int(round(float((daily.get("temperature_2m_min") or [0])[0])))
+    hi     = int(round(float((daily.get("temperature_2m_max") or [0])[0])))
+    desc   = _wmo_code_to_desc(code)
 
     return {
-        "weatherN":     _map_wmo_to_weather_n(code),
+        "weatherN":     _map_wmo_to_weather_n(code, is_day),
         "lo":           lo,
         "hi":           hi,
         "zone":         _ascii(zone),   # ascii-safe for AtomMan serial protocol
