@@ -1,0 +1,37 @@
+"""
+config.py — All user-configurable settings and environment variable overrides.
+Edit this file to change weather location, serial port, timing, etc.
+"""
+import os
+
+# ===================== Weather Settings =====================
+# Open-Meteo is the primary source and requires NO API key.
+# OW_API_KEY is optional — if set, OpenWeather is used as a fallback
+# when Open-Meteo is unreachable. Leave empty for Open-Meteo only.
+OW_API_KEY  = ""               # optional — e.g. "abcdef123456..."
+OW_LOCATION = "77164,fr"       # city | "zip,country" | "lat,lon"
+OW_UNITS    = "metric"         # "metric" (°C) or "imperial" (°F)
+OW_LANG     = "en"             # language for OpenWeather descriptions (fallback only)
+
+# How often (in seconds) to refresh weather data from the API.
+# Override with env var: ATOMMAN_WEATHER_REFRESH=300
+WEATHER_REFRESH_SECONDS = int(os.getenv("ATOMMAN_WEATHER_REFRESH", "600"))
+
+# ===================== Serial Port =====================
+PORT    = os.getenv("ATOMMAN_PORT", "/dev/serial/by-id/usb-Synwit_USB_Virtual_COM-if00")
+BAUD    = int(os.getenv("ATOMMAN_BAUD", "115120").replace("115120", "115200"))
+RTSCTS  = os.getenv("ATOMMAN_RTSCTS", "false").lower() in ("1", "true", "yes", "on")
+DSRDTR  = os.getenv("ATOMMAN_DSRDTR", "true").lower()  in ("1", "true", "yes", "on")
+
+# Protocol trailer bytes (fixed by AtomMan firmware).
+TRAILER = b"\xCC\x33\xC3\x3C"
+
+# ===================== Timing =====================
+# Seconds to wait before opening the serial port (lets USB CDC settle).
+DEFAULT_WAIT_START = float(os.getenv("ATOMMAN_WAIT_START", "3.0"))
+
+# Seconds allowed per unlock attempt.
+UNLOCK_WINDOW = float(os.getenv("ATOMMAN_UNLOCK_SECONDS", "5.0"))
+
+# Sleep after each serial write (avoids flooding the firmware).
+POST_WRITE_SLEEP = float(os.getenv("ATOMMAN_WRITE_SLEEP", "0.006"))
