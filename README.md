@@ -43,7 +43,7 @@ The code is split into focused, independently-testable modules:
 | `gpu.py` | AMD and Intel Arc GPU metrics (temp, VRAM%, name) |
 | `cpu.py` | CPU model, usage %, temperature, frequency, fan RPM |
 | `ram.py` | RAM used/available/total, vendor detection |
-| `disk.py` | Disk usage, temperature, label |
+| `disk.py` | Multi-disk discovery, usage, temperature, friendly labels |
 | `network.py` | Network throughput (RX/TX) with auto-scaling |
 | `weather.py` | Weather fetching (Open-Meteo + OpenWeather fallback) |
 | `colors.py` | ANSI color helpers for the dashboard |
@@ -126,6 +126,63 @@ unnecessary flicker.
 
 ---
 
+## Disk handling (multi-SSD)
+
+All internal physical disks are discovered automatically from `/sys/block/*`
+(NVMe and SATA; loop/ram/zram/optical/removable devices are excluded) and
+cached for one hour. Temperatures are matched per disk by walking the hwmon
+`device` path (`nvme` and `drivetemp` sensors), so each drive reports its own
+value.
+
+Two display modes are available, selected with `DISK_MODE` in `config.py`:
+
+### `aggregate` (default)
+
+The Disk tile shows one logical drive covering every SSD:
+
+- `UsageSpace` / `AllSpace` — **sum** of used and total space across all disks
+- `Usage` — global ratio
+- `Tempr` — hottest disk temperature
+- `DiskName` — friendly per-disk label, e.g. `1: KINGSTON - 2: Linkmore XE430`
+
+### `rotate`
+
+The tile shows **one disk at a time**, alternating every `DISK_ROTATE_SECONDS`
+(default 10 s). Space and temperature follow the displayed disk. The label is
+still the combined one (see the firmware limitation below).
+
+### Friendly labels
+
+The disk name is derived from the sysfs model string:
+
+- brand only for OEM part numbers — `KINGSTON OM8PGP41024Q-A0` → `KINGSTON`
+- brand + short commercial model when one exists —
+  `Linkmore SSD XE430 Pro M.2 2230 Gen4*4 1` → `Linkmore XE430`
+
+A single-disk system keeps the legacy behaviour and shows the **full model
+string** (the firmware marquees it). Numbered labels (`1: … - 2: …`) are only
+used when two disks or more are present.
+
+### Firmware limitation: `DiskName` is latched
+
+The AtomMan firmware registers `DiskName` **at the first tile write after
+power-on** and never updates it again. Numeric fields refresh live; the text
+does not. This was verified on hardware:
+
+| Attempted reset | Result |
+|---|---|
+| `CLEAR` payload | ignored (values update, name stays) |
+| DTR/RTS toggle | no effect on the name |
+| Port close/reopen | reconnects, name unchanged |
+| `power/level` = `off` | rejected by the kernel (`EINVAL`) |
+
+**Consequence:** changing the label requires a full power cycle (shutdown),
+while a mere `systemctl restart atomman` is enough for the numbers. This is why
+`aggregate` sends a label that is valid for every disk instead of trying to
+rotate the name.
+
+---
+
 ## Weather
 
 - **Primary source:** [Open-Meteo](https://open-meteo.com/) — free, no API key required.
@@ -170,6 +227,8 @@ Edit `config.py`:
 | `PORT` | `/dev/serial/by-id/usb-Synwit_USB_Virtual_COM-if00` | Serial port |
 | `BAUD` | `115200` | Baud rate |
 | `GPU_TILE_USEAGE` | `"vram"` | Metric for GPU tile: `"vram"` or `"busy"` |
+| `DISK_MODE` | `"aggregate"` | Multi-disk reporting: `"aggregate"` or `"rotate"` |
+| `DISK_ROTATE_SECONDS` | `10.0` | Seconds each disk is shown in `rotate` mode |
 | `OW_API_KEY` | `""` | OpenWeather API key (optional) |
 | `OW_LOCATION` | `""` | City, `"zip,country"`, or `"lat,lon"` |
 | `OW_UNITS` | `"metric"` | `"metric"` or `"imperial"` |
@@ -223,7 +282,7 @@ AA <TileID> 00 <SEQ> {ASCII payload} CC 33 C3 3C
 | CPU | `0x53` | `{CPU:Intel Core Ultra 9;Tempr:45;Useage:7;Freq:2400000;Tempr1:45;}` |
 | GPU | `0x36` | `{GPU:NITRO+ RX 7900 XTX Vapor-X;Tempr:52;Useage:97}` |
 | MEM | `0x49` | `{Memory:Micron DDR5;Used:18.4;Available:74.2;Total:92.6;Useage:20}` |
-| DISK | `0x4F` | `{DiskName:Samsung 990 Pro;Tempr:41;UsageSpace:512;AllSpace:1907;Usage:27}` |
+| DISK | `0x4F` | `{DiskName:1: KINGSTON - 2: Linkmore XE430;Tempr:31;UsageSpace:650;AllSpace:1908;Usage:34}` |
 | DATE | `0x6B` | `{Date:2026/04/15;Time:22:10:00;Week:4;Weather:3;TemprLo:9,TemprHi:21,Zone:Paris,Desc:clear sky}` |
 | NET | `0x27` | `{SPEED:1200;NETWORK:3.2M/s,512K/s}` |
 
