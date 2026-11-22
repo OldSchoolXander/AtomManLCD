@@ -109,7 +109,10 @@ def p_mem() -> str:
     return f"{{Memory:{label};Used:{used};Available:{avail};Total:{total};Useage:{usage}}}"
 
 
-# Rotation state for DISK_MODE="rotate" (idx -1 → first call picks disk 0)
+# Rotation state for DISK_MODE="rotate" (idx -1 → first call picks disk 0).
+# NOTE: the AtomMan firmware latches DiskName once per tile lifetime — even a
+# CLEAR does not re-register it. So in rotate mode the numbers alternate but
+# the tile keeps a single combined short label that is valid for both disks.
 _disk_rotate = {"idx": -1, "ts": 0.0}
 
 
@@ -135,8 +138,10 @@ def p_dsk() -> str:
             _disk_rotate["ts"]  = now
         d                  = disks[_disk_rotate["idx"]]
         used, total, usage = disk_numbers_for(d)
-        label              = d["model"] or d["name"]
         temp               = _disk_temp_for(d["name"])
+        # DiskName cannot be re-registered after the first write (firmware
+        # limit): use the combined label so it stays valid for both disks.
+        label              = aggregate_disk_label(disks)
     else:
         used, total, usage = aggregate_disk_numbers(disks)
         label              = aggregate_disk_label(disks)

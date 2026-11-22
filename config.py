@@ -54,5 +54,5 @@ GPU_TILE_USEAGE = os.getenv("ATOMMAN_GPU_TILE_USEAGE", "vram")
 DISK_MODE = os.getenv("ATOMMAN_DISK_MODE", "aggregate").lower()
 
 # Seconds each disk stays visible in "rotate" mode.
-# Override with env var: ATOMMAN_DISK_ROTATE=5.0
-DISK_ROTATE_SECONDS = float(os.getenv("ATOMMAN_DISK_ROTATE", "5.0"))
+# Override with env var: ATOMMAN_DISK_ROTATE=10.0
+DISK_ROTATE_SECONDS = float(os.getenv("ATOMMAN_DISK_ROTATE", "10.0"))

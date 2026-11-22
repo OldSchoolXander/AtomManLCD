@@ -204,15 +204,65 @@ def aggregate_disk_numbers(disks: list[dict]) -> tuple[int, int, int]:
     return used, total, usage
 
 
+_GENERIC_WORDS = frozenset({"SSD", "M.2", "NVMe", "GEN3", "GEN4", "GEN4*4", "PRO"})
+
+
 def short_model(model: str) -> str:
-    """First token of a model string (e.g. 'WD Blue SN580 1TB' → 'WD')."""
-    return model.split()[0] if model.split() else "Disk"
+    """Brand/first word of a model string, without part numbers.
+
+    e.g. 'KINGSTON OM8PGP41024Q-A0' → 'KINGSTON'
+         'Linkmore SSD XE430 Pro M.2 2230 Gen4*4 1' → 'Linkmore'
+    Skips leading generic words (SSD, M.2, …) so the brand is picked.
+    """
+    words = model.split()
+    for w in words:
+        if w.upper().strip("(),") not in _GENERIC_WORDS:
+            return w
+    return words[0] if words else "Disk"
 
 
-def aggregate_disk_label(disks: list[dict], max_len: int = 24) -> str:
-    """Combined short label for all disks, e.g. 'Kingston+WD' (bounded length)."""
-    label = "+".join(short_model(d["model"]) for d in disks) or "Disk"
-    return label[:max_len]
+def _marketing_token(model: str) -> str:
+    """First word after the brand that looks like a short marketing model.
+
+    'Linkmore SSD XE430 Pro…' → 'XE430'.  Long OEM part numbers such as
+    'OM8PGP41024Q-A0' are rejected (too long, not human-friendly).
+    """
+    for w in model.split()[1:]:
+        u = w.upper().strip("(),*")
+        if u in _GENERIC_WORDS or not (3 <= len(u) <= 10):
+            continue
+        if any(c.isdigit() for c in u) and any(c.isalpha() for c in u):
+            return w
+    return ""
+
+
+def friendly_model(disk: dict) -> str:
+    """Human-friendly disk name: brand + marketing model when one exists.
+
+    e.g. 'Linkmore XE430', or just 'KINGSTON' for OEM part numbers
+    (the capacity is already shown elsewhere on the tile).
+    """
+    brand = short_model(disk["model"])
+    token = _marketing_token(disk["model"])
+    return f"{brand} {token}" if token else brand
+
+
+def aggregate_disk_label(disks: list[dict], max_len: int = 40) -> str:
+    """Numbered friendly label for all disks, e.g.
+    '1: KINGSTON - 2: Linkmore XE430'.
+
+    With a single disk, return its full model string instead (the legacy
+    behaviour — the firmware marquee scrolls it fine on its own).
+
+    Kept bounded: the AtomMan firmware latches DiskName at the first tile
+    write and never updates it, so multi-disk labels must fit the tile.
+    """
+    if not disks:
+        return "Disk"
+    if len(disks) == 1:
+        return (disks[0]["model"] or disks[0]["name"])[:max_len]
+    parts = [f"{i}: {friendly_model(d)}" for i, d in enumerate(disks, 1)]
+    return " - ".join(parts)[:max_len]
 
 
 # ---------------------------------------------------------------------------
