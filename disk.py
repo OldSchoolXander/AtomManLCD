@@ -1,10 +1,17 @@
 """
 disk.py — Disk metrics: space usage, temperature, and drive label.
 
+Supports multiple internal disks (NVMe + SATA).
+
 Public API:
-  disk_numbers()  — (used_gb, total_gb, usage_pct) for the physical disk.
-  disk_temp_c()   — drive temperature in °C (cached 5 s).
-  disk_label()    — model/vendor string (e.g. "KINGSTON OM8PGP4…"), cached 1 h.
+  discover_disks()          — [{name, model}, ...] for every internal disk (cached 1 h).
+  disk_numbers_for(disk)    — (used_gb, total_gb, usage_pct) for one disk.
+  _disk_temp_for(name)      — per-disk temperature in °C (cached 5 s).
+  aggregate_disk_numbers()  — summed (used_gb, total_gb, usage_pct) over disks.
+  aggregate_disk_label()    — combined short label, e.g. "Kingston+WD".
+  disk_numbers()            — (used_gb, total_gb, usage_pct) for the primary disk.
+  disk_temp_c()             — primary drive temperature in °C (cached 5 s).
+  disk_label()              — primary drive model string (cached 1 h).
 """
 import os
 import re
@@ -120,6 +127,95 @@ def disk_numbers() -> tuple[int, int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Multi-disk discovery (all internal physical disks: NVMe + SATA)
+# ---------------------------------------------------------------------------
+
+# Device-name prefixes that are never real internal disks.
+_EXCLUDED_PREFIXES = ("loop", "ram", "zram", "sr", "fd", "md", "dm-")
+
+_disks_cache: tuple[list, float] = ([], 0.0)
+_DISKS_CACHE_TTL = 3600.0
+
+
+def _is_internal_disk(name: str) -> bool:
+    """True for real internal block devices (excludes loop/USB/optical…)."""
+    if name.startswith(_EXCLUDED_PREFIXES):
+        return False
+    if _read(f"/sys/block/{name}/removable").strip() == "1":
+        return False
+    return os.path.exists(f"/sys/block/{name}/size")
+
+
+def discover_disks() -> list[dict]:
+    """Return every internal physical disk as [{name, model}, ...] (cached 1 h).
+
+    Names come from /sys/block/*; models from /sys/block/<name>/device/model
+    (works for both NVMe and libata SATA), with lsblk as fallback.
+    """
+    global _disks_cache
+    disks, ts = _disks_cache
+    if disks and (time.time() - ts) < _DISKS_CACHE_TTL:
+        return disks
+
+    lsblk_models: dict[str, str] = {}
+    out = _run(["lsblk", "-dno", "NAME,MODEL"])
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[1].strip():
+            lsblk_models[parts[0]] = parts[1].strip()
+
+    result: list[dict] = []
+    for path in sorted(glob.glob("/sys/block/*")):
+        name = os.path.basename(path)
+        if not _is_internal_disk(name) or _disk_total_bytes(name) == 0:
+            continue
+        model = re.sub(r"\s+", " ", _read(os.path.join(path, "device/model"))).strip()
+        if not model:
+            model = re.sub(r"\s+", " ", lsblk_models.get(name, "")).strip()
+        result.append({"name": name, "model": model or name})
+
+    _disks_cache = (result, time.time())
+    return result
+
+
+def disk_numbers_for(disk: dict) -> tuple[int, int, int]:
+    """Return (used_gb, total_gb, usage_pct) for one discovered disk."""
+    name        = disk["name"]
+    total_bytes = _disk_total_bytes(name)
+    used_bytes  = _sum_used_bytes(name)
+
+    to_gb = lambda b: int(round(b / 1024 ** 3))
+    usage = int(round(100.0 * used_bytes / float(total_bytes or 1)))
+    return to_gb(used_bytes), to_gb(total_bytes), usage
+
+
+# ---------------------------------------------------------------------------
+# Aggregate helpers (used by DISK_MODE="aggregate")
+# ---------------------------------------------------------------------------
+
+def aggregate_disk_numbers(disks: list[dict]) -> tuple[int, int, int]:
+    """Return summed (used_gb, total_gb, usage_pct) over all disks."""
+    used = total = 0
+    for d in disks:
+        u, t, _ = disk_numbers_for(d)
+        used  += u
+        total += t
+    usage = int(round(100.0 * used / float(total or 1)))
+    return used, total, usage
+
+
+def short_model(model: str) -> str:
+    """First token of a model string (e.g. 'WD Blue SN580 1TB' → 'WD')."""
+    return model.split()[0] if model.split() else "Disk"
+
+
+def aggregate_disk_label(disks: list[dict], max_len: int = 24) -> str:
+    """Combined short label for all disks, e.g. 'Kingston+WD' (bounded length)."""
+    label = "+".join(short_model(d["model"]) for d in disks) or "Disk"
+    return label[:max_len]
+
+
+# ---------------------------------------------------------------------------
 # Disk temperature (hwmon, cached 5 s)
 # ---------------------------------------------------------------------------
 
@@ -162,6 +258,48 @@ def disk_temp_c() -> int:
     for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
         if _read(os.path.join(hwmon, "name")).strip() == "drivetemp":
             v = _parse(_read(os.path.join(hwmon, "temp1_input")).strip())
+            if v is not None:
+                return _store(v)
+
+    return _store(_DISK_TEMP_DEFAULT)
+
+
+# Per-disk temperature cache: disk name -> (temp, ts)
+_disk_temps_cache: dict[str, tuple[int, float]] = {}
+
+
+def _disk_temp_for(disk_name: str) -> int:
+    """Return one specific disk's temperature in °C (cached 5 s).
+
+    A hwmon sensor belongs to this disk when the sensor's device path is an
+    ancestor of the block-device path — works for both "nvme" hwmon
+    (controller dir is parent of nvme0n1) and "drivetemp" hwmon (the ATA
+    device node is an ancestor of sdX).
+    """
+    now = time.time()
+    hit = _disk_temps_cache.get(disk_name)
+    if hit and (now - hit[1]) < _DISK_TEMP_TTL:
+        return hit[0]
+
+    def _store(v: int) -> int:
+        _disk_temps_cache[disk_name] = (v, now)
+        return v
+
+    def _parse(raw: str) -> int | None:
+        if raw.isdigit():
+            v = int(raw)
+            return v // 1000 if v > 1000 else v
+        return None
+
+    target = os.path.realpath(f"/sys/class/block/{disk_name}")
+    for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+        if _read(os.path.join(hwmon, "name")).strip() not in ("nvme", "drivetemp"):
+            continue
+        dev = os.path.realpath(os.path.join(hwmon, "device"))
+        if target != dev and not target.startswith(dev + os.sep):
+            continue
+        for n in range(1, 5):
+            v = _parse(_read(os.path.join(hwmon, f"temp{n}_input")).strip())
             if v is not None:
                 return _store(v)
 

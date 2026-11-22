@@ -28,12 +28,17 @@ from config import (
     DEFAULT_WAIT_START, UNLOCK_WINDOW, POST_WRITE_SLEEP,
     OW_API_KEY, OW_UNITS, WEATHER_REFRESH_SECONDS,
     GPU_TILE_USEAGE,
+    DISK_MODE, DISK_ROTATE_SECONDS,
 )
 from colors import colorize, temp_color, util_color, usage_color, C
 from cpu    import cpu_model, cpu_usage_pct, cpu_temp_c, cpu_freq_khz, fan_cpu_rpm
 from gpu    import gpu_info, gpu_vram_info, get_intel_arc_info, intel_igpu_mem_info, detect_gpu_vendor
 from ram    import mem_info, ram_label
-from disk   import disk_numbers, disk_temp_c, disk_label
+from disk   import (
+    disk_numbers, disk_temp_c, disk_label,
+    discover_disks, disk_numbers_for, _disk_temp_for,
+    aggregate_disk_numbers, aggregate_disk_label,
+)
 from weather import get_weather_cached, get_weather_age_s
 from network import NetMeter, fmt_rate
 
@@ -104,11 +109,41 @@ def p_mem() -> str:
     return f"{{Memory:{label};Used:{used};Available:{avail};Total:{total};Useage:{usage}}}"
 
 
+# Rotation state for DISK_MODE="rotate" (idx -1 → first call picks disk 0)
+_disk_rotate = {"idx": -1, "ts": 0.0}
+
+
 def p_dsk() -> str:
-    used, total, usage = disk_numbers()
-    label = disk_label() or "Disk"
-    temp  = disk_temp_c()
-    return f"{{DiskName:{label};Tempr:{temp};UsageSpace:{used};AllSpace:{total};Usage:{usage}}}"
+    """Disk tile: reports every internal disk according to DISK_MODE.
+
+    "aggregate" → one logical drive: sums of used/total, hottest temp,
+                  combined short label (e.g. "Kingston+WD").
+    "rotate"    → one disk at a time, switching every DISK_ROTATE_SECONDS.
+    Falls back to the legacy single-disk path when nothing is detected.
+    """
+    disks = discover_disks()
+
+    if not disks:
+        used, total, usage = disk_numbers()
+        return (f"{{DiskName:{disk_label() or 'Disk'};Tempr:{disk_temp_c()};"
+                f"UsageSpace:{used};AllSpace:{total};Usage:{usage}}}")
+
+    if DISK_MODE == "rotate" and len(disks) > 1:
+        now = time.time()
+        if _disk_rotate["idx"] < 0 or now - _disk_rotate["ts"] >= DISK_ROTATE_SECONDS:
+            _disk_rotate["idx"] = (_disk_rotate["idx"] + 1) % len(disks)
+            _disk_rotate["ts"]  = now
+        d                  = disks[_disk_rotate["idx"]]
+        used, total, usage = disk_numbers_for(d)
+        label              = d["model"] or d["name"]
+        temp               = _disk_temp_for(d["name"])
+    else:
+        used, total, usage = aggregate_disk_numbers(disks)
+        label              = aggregate_disk_label(disks)
+        temp               = max(_disk_temp_for(d["name"]) for d in disks)
+
+    return (f"{{DiskName:{label};Tempr:{temp};"
+            f"UsageSpace:{used};AllSpace:{total};Usage:{usage}}}")
 
 
 def p_date() -> str:
@@ -258,14 +293,31 @@ def render_dashboard(latest: dict) -> None:
     print(f"RAM usage      : {muc(str(latest.get('mem_usage', '?')) + ' %')}")
     print()
 
-    # --- Disk ---
-    duc = usage_color(latest.get("disk_usage", "?"))
-    dtc = temp_color(latest.get("disk_temp", 0))
-    print(f"Disk (label)   : {latest.get('disk_label', '')}")
-    print(f"Disk temp      : {dtc(str(latest.get('disk_temp', '0')) + ' °C')}")
-    print(f"Disk used      : {latest.get('disk_used', '?')} GB")
-    print(f"Disk total     : {latest.get('disk_total', '?')} GB")
-    print(f"Disk usage     : {duc(str(latest.get('disk_usage', '?')) + ' %')}")
+    # --- Disk (per-disk detail + aggregate total) ---
+    per_disk = latest.get("disks") or []
+    if per_disk:
+        for i, d in enumerate(per_disk, 1):
+            duc = usage_color(d["usage"])
+            dtc = temp_color(d["temp"])
+            print(f"Disk {i} ({d['model']})")
+            print(f"  Disk temp  : {dtc(str(d['temp']) + ' °C')}")
+            print(f"  Disk used  : {d['used']} GB")
+            print(f"  Disk total : {d['total']} GB")
+            print(f"  Disk usage : {duc(str(d['usage']) + ' %')}")
+        tuc = usage_color(latest.get("disk_usage", "?"))
+        ttc = temp_color(latest.get("disk_temp", 0))
+        print(f"Disk total   : {latest.get('disk_used', '?')} / "
+              f"{latest.get('disk_total', '?')} GB  "
+              f"({tuc(str(latest.get('disk_usage', '?')) + ' %')}) "
+              f"max temp {ttc(str(latest.get('disk_temp', '0')) + ' °C')}")
+    else:
+        duc = usage_color(latest.get("disk_usage", "?"))
+        dtc = temp_color(latest.get("disk_temp", 0))
+        print(f"Disk (label) : {latest.get('disk_label', '')}")
+        print(f"Disk temp    : {dtc(str(latest.get('disk_temp', '0')) + ' °C')}")
+        print(f"Disk used    : {latest.get('disk_used', '?')} GB")
+        print(f"Disk total   : {latest.get('disk_total', '?')} GB")
+        print(f"Disk usage   : {duc(str(latest.get('disk_usage', '?')) + ' %')}")
     print()
 
     # --- Network ---
@@ -344,12 +396,33 @@ def _update_latest(tile_id: int, latest: dict) -> None:
         })
 
     elif tile_id == DSK:
-        used, total, usage = disk_numbers()
-        latest.update({
-            "disk_label": disk_label() or "Disk",
-            "disk_temp":  disk_temp_c(),
-            "disk_used":  used, "disk_total": total, "disk_usage": usage,
-        })
+        disks    = discover_disks()
+        per_disk = []
+        for d in disks:
+            u, t, pc = disk_numbers_for(d)
+            per_disk.append({
+                "name":  d["name"],
+                "model": d["model"] or d["name"],
+                "used":  u, "total": t, "usage": pc,
+                "temp":  _disk_temp_for(d["name"]),
+            })
+
+        if per_disk:
+            au, at, apc = aggregate_disk_numbers(disks)
+            latest.update({
+                "disks":      per_disk,
+                "disk_label": aggregate_disk_label(disks),
+                "disk_temp":  max(p["temp"] for p in per_disk),
+                "disk_used":  au, "disk_total": at, "disk_usage": apc,
+            })
+        else:
+            used, total, usage = disk_numbers()
+            latest.update({
+                "disks":      [],
+                "disk_label": disk_label() or "Disk",
+                "disk_temp":  disk_temp_c(),
+                "disk_used":  used, "disk_total": total, "disk_usage": usage,
+            })
 
     elif tile_id == NET:
         rxk = _last_net.get("rxk")
