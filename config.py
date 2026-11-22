@@ -43,3 +43,16 @@ POST_WRITE_SLEEP = float(os.getenv("ATOMMAN_WRITE_SLEEP", "0.006"))
 #   "busy" → GPU engine busy % — AMD: gpu_busy_percent sysfs (may read 0 for
 #            Vulkan/compute workloads) / Intel: drm-engine-render delta via fdinfo
 GPU_TILE_USEAGE = os.getenv("ATOMMAN_GPU_TILE_USEAGE", "vram")
+
+# ===================== Disk Tile (multi-SSD) =====================
+# How the Disk LCD tile reports multiple internal disks:
+#   "aggregate" → one logical drive: used/total = sum of all disks,
+#                 temp = hottest disk, label = combined short models.
+#   "rotate"    → show one disk at a time on the LCD, alternating every
+#                 DISK_ROTATE_SECONDS seconds.
+# Override with env var: ATOMMAN_DISK_MODE=rotate
+DISK_MODE = os.getenv("ATOMMAN_DISK_MODE", "aggregate").lower()
+
+# Seconds each disk stays visible in "rotate" mode.
+# Override with env var: ATOMMAN_DISK_ROTATE=10.0
+DISK_ROTATE_SECONDS = float(os.getenv("ATOMMAN_DISK_ROTATE", "10.0"))
